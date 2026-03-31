@@ -1,31 +1,32 @@
-import { ClobClient } from "@polymarket/clob-client"
-import { Wallet } from "ethers"
-import "dotenv/config"
-
-const PRIVATE_KEY = process.env.PRIVATE_KEY
-
-if (!PRIVATE_KEY) {
-  throw new Error("PRIVATE_KEY not found in .env")
-}
-
-const wallet = new Wallet(PRIVATE_KEY)
-
-console.log("Wallet address:", wallet.address)
-
-const client = new ClobClient(
-  "https://clob.polymarket.com",
-  137,
-  wallet
-)
+import { ClobClient } from "@polymarket/clob-client";
+import { Wallet } from "ethers"; // v5.8.0
+import "dotenv/config";
 
 async function main() {
+  if (!process.env.PRIVATE_KEY) {
+    throw new Error("PRIVATE_KEY not found in .env");
+  }
 
-  const creds = await client.createApiKey()
+  const client = new ClobClient(
+    "https://clob.polymarket.com",
+    137, // Polygon mainnet
+    new Wallet(process.env.PRIVATE_KEY)
+  );
 
-  console.log("API_KEY:", creds.key)
-  console.log("API_SECRET:", creds.secret)
-  console.log("PASSPHRASE:", creds.passphrase)
+  // Creates new credentials or derives existing ones
+  const credentials = await client.createOrDeriveApiKey();
 
+  console.log(credentials);
+  /*
+  {
+    apiKey: "xxx",
+    secret: "xxx",
+    passphrase: "xxx"
+  }
+  */
 }
 
-main()
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
