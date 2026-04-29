@@ -1,2 +1,4 @@
 node_modules/
 data/
+orderbook_logs/
+.env
