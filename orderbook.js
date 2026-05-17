@@ -1,21 +1,14 @@
 #!/usr/bin/env node
 
 /**
- * Real-time Polymarket BTC 15m Up/Down full orderbook watcher
- * + save all orderbook snapshots into one CSV per 15-minute market
+ * Real-time Polymarket BTC Up/Down best-ask watcher
+ * Saves timestamp, up_ask, down_ask to CSV every second.
  *
  * Usage:
- *   node orderbook.js
- *   node orderbook.js btc-updown-15m-1773345300
- *   node orderbook.js --interval=2000
- *   node orderbook.js btc-updown-15m-1773345300 --interval=1000
- *
- * Notes:
- * - Public data only, no auth needed
- * - If no slug is passed, it keeps resolving the current BTC 15m market
- * - It refreshes the terminal on every poll
- * - Shows top 5 ticks nearest to best bid and best ask
- * - Saves one CSV file per 15-minute market in ./orderbook_logs/
+ *   node orderbook.js                          # 15m market (default)
+ *   node orderbook.js --market=5m              # 5m market
+ *   node orderbook.js --market=15m             # 15m market
+ *   node orderbook.js btc-updown-15m-1773345300  # specific slug
  */
 
 const fs = require("fs");
@@ -23,23 +16,22 @@ const path = require("path");
 
 const GAMMA_HOST = "https://gamma-api.polymarket.com";
 const CLOB_HOST = "https://clob.polymarket.com";
-const MARKET_INTERVAL_SEC = 900; // 15 minutes
 const DEFAULT_ASSET = "btc";
-const DEFAULT_INTERVAL_MS = 100;
+const POLL_INTERVAL_MS = 1000;
 const OUTPUT_DIR = path.join(process.cwd(), "orderbook_logs");
+
+const MARKET_INTERVALS = {
+  "5m": 300,
+  "15m": 900,
+};
+const DEFAULT_MARKET_INTERVAL = "15m";
 
 function nowUnix() {
   return Math.floor(Date.now() / 1000);
 }
 
 function isoNow() {
-  return new Date().toLocaleString("sv-SE", {
-    timeZone: "America/New_York",
-  });
-}
-
-function isoNowUtc() {
-  return new Date().toISOString();
+  return new Date().toLocaleString("sv-SE", { timeZone: "America/New_York" });
 }
 
 function sleep(ms) {
@@ -51,73 +43,58 @@ function clearScreen() {
 }
 
 function ensureDir(dir) {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
 function parseArgs(argv) {
   let inputSlug = null;
-  let intervalMs = DEFAULT_INTERVAL_MS;
+  let marketInterval = DEFAULT_MARKET_INTERVAL;
 
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith("--interval=")) {
-      const value = Number(arg.split("=")[1]);
-      if (Number.isFinite(value) && value >= 250) {
-        intervalMs = value;
-      }
+    if (arg.startsWith("--market=")) {
+      const val = arg.split("=")[1];
+      if (MARKET_INTERVALS[val]) marketInterval = val;
     } else if (!arg.startsWith("--") && !inputSlug) {
       inputSlug = arg;
     }
   }
 
-  return { inputSlug, intervalMs };
+  return { inputSlug, marketInterval };
 }
 
-function buildCandidateSlugs(asset = DEFAULT_ASSET) {
+function buildCandidateSlugs(asset, marketInterval) {
+  const intervalSec = MARKET_INTERVALS[marketInterval];
   const now = nowUnix();
-  const currentBucket = Math.floor(now / MARKET_INTERVAL_SEC) * MARKET_INTERVAL_SEC;
-  const prevBucket = Math.floor((now - MARKET_INTERVAL_SEC) / MARKET_INTERVAL_SEC) * MARKET_INTERVAL_SEC;
-
+  const currentBucket = Math.floor(now / intervalSec) * intervalSec;
+  const prevBucket = currentBucket - intervalSec;
   return [
-    `${asset}-updown-15m-${currentBucket}`,
-    `${asset}-updown-15m-${prevBucket}`,
+    `${asset}-updown-${marketInterval}-${currentBucket}`,
+    `${asset}-updown-${marketInterval}-${prevBucket}`,
   ];
 }
 
 async function getJson(url) {
   const res = await fetch(url, {
-    headers: {
-      accept: "application/json",
-      "user-agent": "node-orderbook-realtime/1.3",
-    },
+    headers: { accept: "application/json", "user-agent": "node-orderbook-realtime/2.0" },
   });
-
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`HTTP ${res.status} for ${url}\n${text}`);
   }
-
   return res.json();
 }
 
 async function fetchMarketBySlug(slug) {
   const url = `${GAMMA_HOST}/markets?slug=${encodeURIComponent(slug)}`;
   const items = await getJson(url);
-  if (!Array.isArray(items) || items.length === 0) {
-    return null;
-  }
+  if (!Array.isArray(items) || items.length === 0) return null;
   return items[0];
 }
 
 function parseMaybeJsonArray(value) {
   if (Array.isArray(value)) return value;
   if (typeof value === "string") {
-    try {
-      return JSON.parse(value);
-    } catch {
-      return [];
-    }
+    try { return JSON.parse(value); } catch { return []; }
   }
   return [];
 }
@@ -132,65 +109,43 @@ function parseMarket(raw) {
   const safeUpIndex = upIndex >= 0 ? upIndex : 0;
   const safeDownIndex = downIndex >= 0 ? downIndex : (clobTokenIds.length > 1 ? 1 : 0);
 
-  // extract start unix timestamp from slug (btc-updown-15m-{ts})
-  const slugMatch = (raw.slug || "").match(/btc-updown-15m-(\d+)/);
-  const startTimeSec = slugMatch ? Number(slugMatch[1]) : null;
-
   return {
     slug: raw.slug,
     question: raw.question,
-    conditionId: raw.conditionId,
     endDate: raw.endDate,
-    outcomes,
     upTokenId: clobTokenIds[safeUpIndex] || "",
     downTokenId: clobTokenIds[safeDownIndex] || "",
-    startTimeSec,
   };
 }
 
-// Polymarket uses Pyth Network oracle for all BTC prices.
-// Feed ID is resolved dynamically so it's always correct.
-let _pythBtcFeedId = null; // cached after first lookup
-
-function parsePythPrice(priceObj) {
-  // Pyth returns price as integer + exponent, e.g. price=6631890000 expo=-5 → 66318.90
-  return Number(priceObj.price) * Math.pow(10, priceObj.expo);
-}
-
-async function getPythBtcFeedId() {
-  if (_pythBtcFeedId) return _pythBtcFeedId;
-  // Search Pyth feeds for BTC/USD crypto feed
-  const data = await getJson("https://hermes.pyth.network/v2/price_feeds?query=BTC%2FUSD&asset_type=crypto");
-  const feed = data.find(f =>
-    f.attributes?.base === "BTC" && f.attributes?.quote_currency === "USD"
-  );
-  if (!feed) throw new Error("Pyth BTC/USD feed not found");
-  _pythBtcFeedId = "0x" + feed.id.replace(/^0x/, "");
-  return _pythBtcFeedId;
-}
-
-async function fetchBtcPrice() {
-  try {
-    const feedId = await getPythBtcFeedId();
-    const url = `https://hermes.pyth.network/v2/updates/price/latest?ids[]=${feedId}`;
-    const data = await getJson(url);
-    return parsePythPrice(data.parsed[0].price);
-  } catch {
-    return null;
+async function resolveMarket(inputSlug, marketInterval) {
+  if (inputSlug) {
+    const raw = await fetchMarketBySlug(inputSlug);
+    if (!raw) throw new Error(`Market not found for slug: ${inputSlug}`);
+    return parseMarket(raw);
   }
+
+  const candidates = buildCandidateSlugs(DEFAULT_ASSET, marketInterval);
+  for (const slug of candidates) {
+    try {
+      const raw = await fetchMarketBySlug(slug);
+      if (raw) return parseMarket(raw);
+    } catch { /* try next */ }
+  }
+
+  throw new Error(`Could not find active BTC ${marketInterval} market`);
 }
 
-async function fetchPriceToBeat(startTimeSec) {
-  try {
-    const feedId = await getPythBtcFeedId();
-    // Fetch Pyth price at the exact second the market opened
-    const url = `https://hermes.pyth.network/v2/updates/price/${startTimeSec}?ids[]=${feedId}`;
-    const data = await getJson(url);
-    if (!data?.parsed?.[0]) return null;
-    return parsePythPrice(data.parsed[0].price);
-  } catch {
-    return null;
-  }
+async function fetchBook(tokenId) {
+  return getJson(`${CLOB_HOST}/book?token_id=${encodeURIComponent(tokenId)}`);
+}
+
+function getBestAsk(book) {
+  if (!Array.isArray(book.asks) || book.asks.length === 0) return null;
+  return book.asks
+    .map(x => Number(x.price))
+    .filter(p => Number.isFinite(p))
+    .reduce((min, p) => (p < min ? p : min), Infinity);
 }
 
 function timeLeft(endDateStr) {
@@ -203,468 +158,83 @@ function timeLeft(endDateStr) {
   return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
 }
 
-async function resolveMarket(inputSlug) {
-  if (inputSlug) {
-    const raw = await fetchMarketBySlug(inputSlug);
-    if (!raw) {
-      throw new Error(`Market not found for slug: ${inputSlug}`);
-    }
-    return parseMarket(raw);
-  }
-
-  const candidates = buildCandidateSlugs(DEFAULT_ASSET);
-  for (const slug of candidates) {
-    try {
-      const raw = await fetchMarketBySlug(slug);
-      if (raw) {
-        return parseMarket(raw);
-      }
-    } catch {
-      // try next
-    }
-  }
-
-  throw new Error("Could not find active/current BTC 15m market");
-}
-
-async function fetchBook(tokenId) {
-  const url = `${CLOB_HOST}/book?token_id=${encodeURIComponent(tokenId)}`;
-  return getJson(url);
-}
-
-function normalizeLevels(levels) {
-  if (!Array.isArray(levels)) return [];
-
-  return levels
-    .map(x => ({
-      price: Number(x.price),
-      size: Number(x.size),
-    }))
-    .filter(x => Number.isFinite(x.price) && Number.isFinite(x.size));
-}
-
-function sortBidsDesc(levels) {
-  return [...levels].sort((a, b) => {
-    if (b.price !== a.price) return b.price - a.price;
-    return b.size - a.size;
-  });
-}
-
-function sortAsksAsc(levels) {
-  return [...levels].sort((a, b) => {
-    if (a.price !== b.price) return a.price - b.price;
-    return b.size - a.size;
-  });
-}
-
-const TOP_TICKS = 5;
-
-function summarizeBook(book) {
-  const allBids = sortBidsDesc(normalizeLevels(book.bids));
-  const allAsks = sortAsksAsc(normalizeLevels(book.asks));
-
-  const bestBid = allBids.length ? allBids[0].price : null;
-  const bestAsk = allAsks.length ? allAsks[0].price : null;
-
-  // only keep the 5 ticks closest to the spread
-  const bids = allBids.slice(0, TOP_TICKS);
-  const asks = allAsks.slice(0, TOP_TICKS);
-
-  const bidDepthAll = bids.reduce((sum, x) => sum + x.size, 0);
-  const askDepthAll = asks.reduce((sum, x) => sum + x.size, 0);
-
-  const spread =
-    bestBid !== null && bestAsk !== null
-      ? Number((bestAsk - bestBid).toFixed(6))
-      : null;
-
-  return {
-    market: book.market,
-    assetId: book.asset_id,
-    timestamp: book.timestamp,
-    hash: book.hash ?? "",
-    bestBid,
-    bestAsk,
-    spread,
-    bidSize: bids.length ? bids[0].size : 0,
-    askSize: asks.length ? asks[0].size : 0,
-    bidDepthAll,
-    askDepthAll,
-    minOrderSize: book.min_order_size,
-    tickSize: book.tick_size,
-    bids,
-    asks,
-    rawBidCount: Array.isArray(book.bids) ? book.bids.length : 0,
-    rawAskCount: Array.isArray(book.asks) ? book.asks.length : 0,
-  };
-}
-
-function movementArrow(current, previous) {
-  if (current == null) return " ";
-  if (previous == null) return " ";
-  if (current > previous) return "↑";
-  if (current < previous) return "↓";
-  return "→";
-}
-
-function fmtNum(v, digits = 3) {
-  if (v == null || Number.isNaN(v)) return "-";
-  return Number(v).toFixed(digits);
-}
-
-function fmtSize(v) {
-  if (v == null || Number.isNaN(v)) return "-";
-  return Number(v).toFixed(2);
-}
-
-
-function renderScreen({ market, down, prevDown, pollCount, intervalMs, csvPath, btcPrice, priceToBeat }) {
+function renderScreen({ market, upAsk, downAsk, pollCount, csvPath, marketInterval }) {
   clearScreen();
-
-  const left = timeLeft(market.endDate);
-  const diff = btcPrice != null && priceToBeat != null ? btcPrice - priceToBeat : null;
-  const diffStr = diff != null
-    ? `${diff >= 0 ? "+" : ""}${diff.toFixed(2)}`
-    : "-";
-  const askMove = movementArrow(down.bestAsk, prevDown?.bestAsk);
-
-  console.log("=== BTC 15m Polymarket ===");
-  console.log(`Time         : ${isoNow()} ET`);
-  console.log(`Market       : ${market.slug}`);
-  console.log(`Time left    : ${left}`);
-  console.log(`Price to beat: ${priceToBeat != null ? "$" + priceToBeat.toFixed(2) : "-"}`);
-  console.log(`BTC price    : ${btcPrice != null ? "$" + btcPrice.toFixed(2) : "-"}`);
-  console.log(`Difference   : ${diffStr}`);
-  console.log(`Poll #       : ${pollCount}  |  ${intervalMs}ms  |  CSV: ${csvPath}`);
-
-  console.log(`\n=== DOWN asks (5 ticks near best ask) ===`);
-  console.log(`bestAsk      : ${fmtNum(down.bestAsk)} ${askMove}`);
-  console.log(`topAskSize   : ${fmtSize(down.askSize)} shares`);
-  console.log(`askDepth (5) : ${fmtSize(down.askDepthAll)} shares`);
-  console.log(`rawAskCount  : ${down.rawAskCount}`);
+  console.log(`=== BTC ${marketInterval} Polymarket — Best Ask Watcher ===`);
+  console.log(`Time     : ${isoNow()} ET`);
+  console.log(`Market   : ${market.slug}`);
+  console.log(`Time left: ${timeLeft(market.endDate)}`);
+  console.log(`Poll #   : ${pollCount}  |  ${POLL_INTERVAL_MS}ms  |  CSV: ${path.basename(csvPath)}`);
   console.log("");
-
-  if (down.asks.length === 0) {
-    console.log("  -");
-  } else {
-    for (let i = 0; i < down.asks.length; i++) {
-      const row = down.asks[i];
-      const usdc = (row.price * row.size).toFixed(2);
-      console.log(`  [${i + 1}] ${fmtNum(row.price)} x ${fmtSize(row.size)} shares  (~$${usdc} USDC)`);
-    }
-  }
-
+  console.log(`UP   ask : ${upAsk != null ? upAsk.toFixed(4) : "-"}`);
+  console.log(`DOWN ask : ${downAsk != null ? downAsk.toFixed(4) : "-"}`);
   console.log("\nPress Ctrl+C to stop.");
 }
 
-function escapeCsv(value) {
-  if (value == null) return "";
-  const s = String(value);
-  if (s.includes('"') || s.includes(",") || s.includes("\n")) {
-    return `"${s.replace(/"/g, '""')}"`;
-  }
-  return s;
-}
-
-function getCsvPathForMarket(slug) {
-  return path.join(OUTPUT_DIR, `${slug}.csv`);
+function getCsvPath(slug) {
+  return path.join(OUTPUT_DIR, `${slug}_best_ask.csv`);
 }
 
 function ensureCsvHeader(csvPath) {
   if (fs.existsSync(csvPath)) return;
-
-  const header = [
-    "captured_at_et",
-    "captured_at_utc",
-    "poll_count",
-    "market_slug",
-    "question",
-    "condition_id",
-    "end_date",
-    "market_book_id",
-    "outcome_side",
-    "token_id",
-    "book_timestamp",
-    "book_hash",
-    "min_order_size",
-    "tick_size",
-    "best_bid",
-    "best_ask",
-    "spread",
-    "top_bid_size",
-    "top_ask_size",
-    "bid_depth_all",
-    "ask_depth_all",
-    "bid_levels",
-    "ask_levels",
-    "raw_bid_count",
-    "raw_ask_count",
-    "level_type",
-    "level_index",
-    "price",
-    "size",
-  ].join(",");
-
-  fs.writeFileSync(csvPath, header + "\n", "utf8");
+  fs.writeFileSync(csvPath, "timestamp,up_ask,down_ask\n", "utf8");
 }
 
-function buildCsvRowsForSide({
-  market,
-  summary,
-  outcomeSide,
-  capturedAtEt,
-  capturedAtUtc,
-  pollCount,
-}) {
-  const rows = [];
-
-  const common = {
-    capturedAtEt,
-    capturedAtUtc,
-    pollCount,
-    marketSlug: market.slug,
-    question: market.question,
-    conditionId: market.conditionId,
-    endDate: market.endDate,
-    marketBookId: summary.market,
-    outcomeSide,
-    tokenId: summary.assetId,
-    bookTimestamp: summary.timestamp,
-    bookHash: summary.hash,
-    minOrderSize: summary.minOrderSize,
-    tickSize: summary.tickSize,
-    bestBid: summary.bestBid,
-    bestAsk: summary.bestAsk,
-    spread: summary.spread,
-    topBidSize: summary.bidSize,
-    topAskSize: summary.askSize,
-    bidDepthAll: summary.bidDepthAll,
-    askDepthAll: summary.askDepthAll,
-    bidLevels: summary.bids.length,
-    askLevels: summary.asks.length,
-    rawBidCount: summary.rawBidCount,
-    rawAskCount: summary.rawAskCount,
-  };
-
-  for (let i = 0; i < summary.bids.length; i++) {
-    const level = summary.bids[i];
-    rows.push([
-      common.capturedAtEt,
-      common.capturedAtUtc,
-      common.pollCount,
-      common.marketSlug,
-      common.question,
-      common.conditionId,
-      common.endDate,
-      common.marketBookId,
-      common.outcomeSide,
-      common.tokenId,
-      common.bookTimestamp,
-      common.bookHash,
-      common.minOrderSize,
-      common.tickSize,
-      common.bestBid,
-      common.bestAsk,
-      common.spread,
-      common.topBidSize,
-      common.topAskSize,
-      common.bidDepthAll,
-      common.askDepthAll,
-      common.bidLevels,
-      common.askLevels,
-      common.rawBidCount,
-      common.rawAskCount,
-      "bid",
-      i,
-      level.price,
-      level.size,
-    ]);
-  }
-
-  for (let i = 0; i < summary.asks.length; i++) {
-    const level = summary.asks[i];
-    rows.push([
-      common.capturedAtEt,
-      common.capturedAtUtc,
-      common.pollCount,
-      common.marketSlug,
-      common.question,
-      common.conditionId,
-      common.endDate,
-      common.marketBookId,
-      common.outcomeSide,
-      common.tokenId,
-      common.bookTimestamp,
-      common.bookHash,
-      common.minOrderSize,
-      common.tickSize,
-      common.bestBid,
-      common.bestAsk,
-      common.spread,
-      common.topBidSize,
-      common.topAskSize,
-      common.bidDepthAll,
-      common.askDepthAll,
-      common.bidLevels,
-      common.askLevels,
-      common.rawBidCount,
-      common.rawAskCount,
-      "ask",
-      i,
-      level.price,
-      level.size,
-    ]);
-  }
-
-  if (rows.length === 0) {
-    rows.push([
-      common.capturedAtEt,
-      common.capturedAtUtc,
-      common.pollCount,
-      common.marketSlug,
-      common.question,
-      common.conditionId,
-      common.endDate,
-      common.marketBookId,
-      common.outcomeSide,
-      common.tokenId,
-      common.bookTimestamp,
-      common.bookHash,
-      common.minOrderSize,
-      common.tickSize,
-      common.bestBid,
-      common.bestAsk,
-      common.spread,
-      common.topBidSize,
-      common.topAskSize,
-      common.bidDepthAll,
-      common.askDepthAll,
-      common.bidLevels,
-      common.askLevels,
-      common.rawBidCount,
-      common.rawAskCount,
-      "",
-      "",
-      "",
-      "",
-    ]);
-  }
-
-  return rows;
-}
-
-function appendSnapshotToCsv({ market, up, down, pollCount }) {
-  ensureDir(OUTPUT_DIR);
-
-  const csvPath = getCsvPathForMarket(market.slug);
-  ensureCsvHeader(csvPath);
-
-  const capturedAtEt = isoNow();
-  const capturedAtUtc = isoNowUtc();
-
-  const upRows = buildCsvRowsForSide({
-    market,
-    summary: up,
-    outcomeSide: "UP",
-    capturedAtEt,
-    capturedAtUtc,
-    pollCount,
-  });
-
-  const downRows = buildCsvRowsForSide({
-    market,
-    summary: down,
-    outcomeSide: "DOWN",
-    capturedAtEt,
-    capturedAtUtc,
-    pollCount,
-  });
-
-  const lines = [...upRows, ...downRows]
-    .map(row => row.map(escapeCsv).join(","))
-    .join("\n") + "\n";
-
-  fs.appendFileSync(csvPath, lines, "utf8");
-  return csvPath;
-}
-
-async function fetchSnapshot(inputSlug) {
-  const market = await resolveMarket(inputSlug);
-
-  if (!market.upTokenId || !market.downTokenId) {
-    throw new Error(`Missing Up/Down token IDs for market ${market.slug}`);
-  }
-
-  const [upBookRaw, downBookRaw, btcPrice, priceToBeat] = await Promise.all([
-    fetchBook(market.upTokenId),
-    fetchBook(market.downTokenId),
-    fetchBtcPrice(),
-    market.startTimeSec ? fetchPriceToBeat(market.startTimeSec) : Promise.resolve(null),
-  ]);
-
-  return {
-    market,
-    up: summarizeBook(upBookRaw),
-    down: summarizeBook(downBookRaw),
-    btcPrice,
-    priceToBeat,
-  };
+function appendCsvRow(csvPath, timestamp, upAsk, downAsk) {
+  const up = upAsk != null ? upAsk.toFixed(4) : "";
+  const down = downAsk != null ? downAsk.toFixed(4) : "";
+  fs.appendFileSync(csvPath, `${timestamp},${up},${down}\n`, "utf8");
 }
 
 async function main() {
-  const { inputSlug, intervalMs } = parseArgs(process.argv);
-
+  const { inputSlug, marketInterval } = parseArgs(process.argv);
   ensureDir(OUTPUT_DIR);
 
-  let prevDown = null;
   let pollCount = 0;
   let failureCount = 0;
   let currentMarketSlug = null;
+  let csvPath = null;
 
   while (true) {
     try {
-      const { market, up, down, btcPrice, priceToBeat } = await fetchSnapshot(inputSlug);
-      pollCount += 1;
-      failureCount = 0;
+      const market = await resolveMarket(inputSlug, marketInterval);
+
+      if (!market.upTokenId || !market.downTokenId) {
+        throw new Error(`Missing Up/Down token IDs for market ${market.slug}`);
+      }
 
       if (currentMarketSlug !== market.slug) {
         currentMarketSlug = market.slug;
-        prevDown = null;
+        csvPath = getCsvPath(market.slug);
+        ensureCsvHeader(csvPath);
       }
 
-      const csvPath = appendSnapshotToCsv({
-        market,
-        up,
-        down,
-        pollCount,
-      });
+      const [upBook, downBook] = await Promise.all([
+        fetchBook(market.upTokenId),
+        fetchBook(market.downTokenId),
+      ]);
 
-      renderScreen({
-        market,
-        down,
-        prevDown,
-        pollCount,
-        intervalMs,
-        csvPath,
-        btcPrice,
-        priceToBeat,
-      });
+      const upAsk = getBestAsk(upBook);
+      const downAsk = getBestAsk(downBook);
+      const timestamp = nowUnix();
 
-      prevDown = down;
+      pollCount += 1;
+      failureCount = 0;
+
+      appendCsvRow(csvPath, timestamp, upAsk, downAsk);
+      renderScreen({ market, upAsk, downAsk, pollCount, csvPath, marketInterval });
+
     } catch (err) {
       failureCount += 1;
       clearScreen();
-      console.error("Polymarket BTC 15m real-time FULL orderbook");
-      console.error(`Updated      : ${isoNow()} ET`);
-      console.error(`Poll #       : ${pollCount}`);
-      console.error(`Failures     : ${failureCount}`);
-      console.error(`Output dir   : ${OUTPUT_DIR}`);
-      console.error("\nERROR:");
-      console.error(err.message || err);
-      console.error(`\nRetrying in ${intervalMs} ms...`);
+      console.error(`BTC ${marketInterval} best-ask watcher`);
+      console.error(`Updated  : ${isoNow()} ET`);
+      console.error(`Poll #   : ${pollCount}  |  Failures: ${failureCount}`);
+      console.error(`\nERROR: ${err.message || err}`);
+      console.error(`\nRetrying in ${POLL_INTERVAL_MS}ms...`);
     }
 
-    await sleep(intervalMs);
+    await sleep(POLL_INTERVAL_MS);
   }
 }
 
