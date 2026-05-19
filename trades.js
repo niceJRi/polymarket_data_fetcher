@@ -8,16 +8,43 @@ const MIN_WINDOW_SECONDS = 3600
 const POLL_INTERVAL_MS = 3000
 
 if (!WALLET) {
-  console.log("Usage: node index9.js WALLET")
+  console.log("Usage: node trades.js WALLET")
   process.exit(1)
 }
 
-const file = fs.createWriteStream("btc_5min_trades_2026_live.csv", { flags: "w" })
-file.write("timestampET,timestampUnix,title,slug,size,usdcSize,price,side,outcome,txHash\n")
+const MARKETS = [
+  { key: "btc5m",   coins: ["bitcoin", "btc"],         interval: 5,  file: "btc_5min_trades_2026_live.csv" },
+  { key: "btc15m",  coins: ["bitcoin", "btc"],         interval: 15, file: "btc_15min_trades_2026_live.csv" },
+  { key: "eth5m",   coins: ["ethereum", "eth"],        interval: 5,  file: "eth_5min_trades_2026_live.csv" },
+  { key: "eth15m",  coins: ["ethereum", "eth"],        interval: 15, file: "eth_15min_trades_2026_live.csv" },
+  { key: "bnb5m",   coins: ["binance", "bnb"],         interval: 5,  file: "bnb_5min_trades_2026_live.csv" },
+  { key: "bnb15m",  coins: ["binance", "bnb"],         interval: 15, file: "bnb_15min_trades_2026_live.csv" },
+  { key: "xrp5m",   coins: ["ripple", "xrp"],          interval: 5,  file: "xrp_5min_trades_2026_live.csv" },
+  { key: "xrp15m",  coins: ["ripple", "xrp"],          interval: 15, file: "xrp_15min_trades_2026_live.csv" },
+  { key: "sol5m",   coins: ["solana", "sol"],           interval: 5,  file: "sol_5min_trades_2026_live.csv" },
+  { key: "sol15m",  coins: ["solana", "sol"],           interval: 15, file: "sol_15min_trades_2026_live.csv" },
+  { key: "hype5m",  coins: ["hyperliquid", "hype"],    interval: 5,  file: "hype_5min_trades_2026_live.csv" },
+  { key: "hype15m", coins: ["hyperliquid", "hype"],    interval: 15, file: "hype_15min_trades_2026_live.csv" },
+  { key: "doge5m",  coins: ["dogecoin", "doge"],        interval: 5,  file: "doge_5min_trades_2026_live.csv" },
+  { key: "doge15m", coins: ["dogecoin", "doge"],        interval: 15, file: "doge_15min_trades_2026_live.csv" },
+]
 
-const seen = new Set()
+// (?<![0-9])5m(?![0-9a-zA-Z]) prevents "15m" from matching the 5m rule
+const INTERVAL_SLUG_RX = {
+  5:  /(?<![0-9])5m(?![0-9a-zA-Z])|(?<![0-9])5min/,
+  15: /15m|15min/,
+}
+
+const CSV_HEADER = "timestampET,timestampUnix,title,slug,size,usdcSize,price,side,outcome,txHash\n"
+
+for (const m of MARKETS) {
+  m.stream = fs.createWriteStream(m.file, { flags: "w" })
+  m.stream.write(CSV_HEADER)
+  m.seen = new Set()
+  m.saved = 0
+}
+
 let totalFetched = 0
-let totalSaved = 0
 let requestCount = 0
 let newestSeenTimestamp = 0
 
@@ -46,62 +73,45 @@ function buildUrl(startTs, endTs, offset) {
     start: String(startTs),
     end: String(endTs),
   })
-
   return `https://data-api.polymarket.com/activity?${params.toString()}`
 }
 
 async function fetchPage(startTs, endTs, offset) {
   const url = buildUrl(startTs, endTs, offset)
   requestCount++
-
   try {
     const res = await axios.get(url, { timeout: 30000 })
     return res.data
   } catch (err) {
     const status = err.response?.status
     const body = err.response?.data
-
     console.log("\nRequest failed")
     console.log("URL:", url)
     console.log("Status:", status || "unknown")
     if (body) {
       console.log("Response:", typeof body === "string" ? body : JSON.stringify(body))
     }
-
     throw err
   }
 }
 
-function isBtc5mTrade(t) {
+function matchesMarket(t, market) {
   const title = (t.title || "").toLowerCase()
   const slug = (t.slug || t.market?.slug || t.marketSlug || "").toLowerCase()
 
-  const isBtc =
-    title.includes("bitcoin") ||
-    title.includes("btc") ||
-    slug.includes("bitcoin") ||
-    slug.includes("btc")
+  const hasCoin = market.coins.some(c => title.includes(c) || slug.includes(c))
+  if (!hasCoin) return false
 
-  const isFiveMin =
-    title.includes("5 min") ||
-    title.includes("5-min") ||
-    title.includes("5 minute") ||
-    title.includes("5-minute") ||
-    slug.includes("5m") ||
-    slug.includes("5-min") ||
-    slug.includes("5minute")
+  const n = market.interval
+  const titlePatterns = [`${n} min`, `${n}-min`, `${n} minute`, `${n}-minute`]
+  const hasInterval = titlePatterns.some(p => title.includes(p)) || INTERVAL_SLUG_RX[n].test(slug)
+  if (!hasInterval) return false
 
-  const isDirectional =
-    title.includes("up or down") ||
-    title.includes("above") ||
-    title.includes("below") ||
-    title.includes("higher") ||
-    title.includes("lower") ||
-    slug.includes("updown") ||
-    slug.includes("above") ||
-    slug.includes("below")
-
-  return isBtc && isFiveMin && isDirectional
+  return (
+    title.includes("up or down") || title.includes("above") || title.includes("below") ||
+    title.includes("higher") || title.includes("lower") ||
+    slug.includes("updown") || slug.includes("above") || slug.includes("below")
+  )
 }
 
 function rowKey(t) {
@@ -115,49 +125,47 @@ function rowKey(t) {
   ].join("_")
 }
 
-function writeRow(t) {
+function writeRow(stream, t) {
   const title = (t.title || "").replace(/"/g, '""')
   const slug = (t.slug || t.market?.slug || t.marketSlug || "").replace(/"/g, '""')
-
-  const line =
+  stream.write(
     `${toET(t.timestamp)},${t.timestamp},"${title}","${slug}",${t.size ?? ""},${t.usdcSize ?? ""},${t.price ?? ""},${t.side ?? ""},${t.outcome ?? ""},${t.transactionHash ?? ""}\n`
+  )
+}
 
-  file.write(line)
+function totalSaved() {
+  return MARKETS.reduce((s, m) => s + m.saved, 0)
 }
 
 async function processRows(rows, liveMode = false) {
-  let saved = 0
+  let savedThisBatch = 0
 
   for (const t of rows) {
     totalFetched++
-
     if (!t.timestamp) continue
-    if (t.timestamp > newestSeenTimestamp) {
-      newestSeenTimestamp = t.timestamp
-    }
-
-    if (!isBtc5mTrade(t)) continue
+    if (t.timestamp > newestSeenTimestamp) newestSeenTimestamp = t.timestamp
 
     const key = rowKey(t)
-    if (seen.has(key)) continue
-    seen.add(key)
 
-    writeRow(t)
-    saved++
-    totalSaved++
+    for (const market of MARKETS) {
+      if (!matchesMarket(t, market)) continue
+      if (market.seen.has(key)) continue
+      market.seen.add(key)
+      writeRow(market.stream, t)
+      market.saved++
+      savedThisBatch++
 
-    if (liveMode) {
-      console.log(`LIVE ${toET(t.timestamp)} | ${t.side} | ${t.outcome} | ${t.price} | ${t.size}`)
+      if (liveMode) {
+        console.log(`LIVE [${market.key}] ${toET(t.timestamp)} | ${t.side} | ${t.outcome} | ${t.price} | ${t.size}`)
+      }
     }
   }
 
-  return saved
+  return savedThisBatch
 }
 
-// Backfill newest -> older
 async function crawlWindow(startTs, endTs, depth = 0) {
   const indent = " ".repeat(depth * 2)
-
   if (startTs > endTs) return
 
   let offset = 0
@@ -168,34 +176,26 @@ async function crawlWindow(startTs, endTs, depth = 0) {
     const rows = await fetchPage(startTs, endTs, offset)
 
     if (!Array.isArray(rows) || rows.length === 0) {
-      if (page === 1) {
-        console.log(`${indent}window ${startTs}-${endTs} | empty`)
-      }
+      if (page === 1) console.log(`${indent}window ${startTs}-${endTs} | empty`)
       return
     }
 
     const saved = await processRows(rows, false)
 
     console.log(
-      `${indent}window ${startTs}-${endTs} | page ${page} | offset ${offset} | fetched ${rows.length} | saved ${saved} | total ${totalSaved}`
+      `${indent}window ${startTs}-${endTs} | page ${page} | offset ${offset} | fetched ${rows.length} | saved ${saved} | total ${totalSaved()}`
     )
 
-    if (rows.length < LIMIT) {
-      return
-    }
+    if (rows.length < LIMIT) return
 
     if (offset === MAX_HISTORICAL_OFFSET && rows.length === LIMIT) {
       const span = endTs - startTs
-
       if (span <= MIN_WINDOW_SECONDS) {
         console.log(`${indent}dense window hit cap and can't split smaller: ${startTs}-${endTs}`)
         return
       }
-
       const mid = Math.floor((startTs + endTs) / 2)
       console.log(`${indent}splitting dense window ${startTs}-${endTs}`)
-
-      // newer half first, then older half
       await crawlWindow(mid + 1, endTs, depth + 1)
       await crawlWindow(startTs, mid, depth + 1)
       return
@@ -206,7 +206,6 @@ async function crawlWindow(startTs, endTs, depth = 0) {
   }
 }
 
-// Near-real-time tailing of latest page
 async function livePoll(startTs) {
   console.log(`\nEntering live polling mode every ${POLL_INTERVAL_MS} ms...\n`)
 
@@ -216,7 +215,6 @@ async function livePoll(startTs) {
       const rows = await fetchPage(startTs, endTs, 0)
 
       if (Array.isArray(rows) && rows.length > 0) {
-        // newest first already; reverse so console/file append feels chronological for newly arrived rows
         const freshOnly = rows.filter(r => (r.timestamp || 0) >= newestSeenTimestamp - 5)
         await processRows(freshOnly.reverse(), true)
       }
@@ -239,12 +237,15 @@ async function main() {
     console.log("\nBackfill complete")
     console.log("Requests:", requestCount)
     console.log("Rows fetched:", totalFetched)
-    console.log("Rows saved:", totalSaved)
+    console.log("Rows saved:", totalSaved())
+    for (const m of MARKETS) {
+      console.log(`  ${m.key}: ${m.saved} rows → ${m.file}`)
+    }
     console.log("Newest timestamp seen:", newestSeenTimestamp, toET(newestSeenTimestamp))
 
     await livePoll(startTs)
   } catch (err) {
-    file.end()
+    for (const m of MARKETS) m.stream.end()
     console.log("\nFatal error:", err.message)
   }
 }
