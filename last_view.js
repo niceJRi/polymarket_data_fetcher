@@ -170,16 +170,29 @@ function processTrade(t, market) {
   if (ts > ms.lastTs) ms.lastTs = ts
 }
 
+const UP_OUTCOMES   = new Set(["YES", "UP"])
+const DOWN_OUTCOMES = new Set(["NO",  "DOWN"])
+
 function derivePrices(key) {
   let yesPrice = null
   let noPrice  = null
   for (const t of mstate[key].currentTrades) {
     const o = (t.outcome || "").toUpperCase()
-    if (yesPrice === null && o === "YES") yesPrice = Number(t.price)
-    if (noPrice  === null && o === "NO")  noPrice  = Number(t.price)
+    if (yesPrice === null && UP_OUTCOMES.has(o))   yesPrice = Number(t.price)
+    if (noPrice  === null && DOWN_OUTCOMES.has(o)) noPrice  = Number(t.price)
     if (yesPrice !== null && noPrice !== null) break
   }
   return { yesPrice, noPrice }
+}
+
+// Returns the actual outcome labels used by this market's trades (UP/DOWN or YES/NO)
+function getOutcomeLabels(key) {
+  for (const t of mstate[key].currentTrades) {
+    const o = (t.outcome || "").toUpperCase()
+    if (o === "UP"   || o === "DOWN") return { up: "UP",  dn: "DOWN" }
+    if (o === "YES"  || o === "NO")   return { up: "YES", dn: "NO"   }
+  }
+  return { up: "YES", dn: "NO" }
 }
 
 function fmtTrade(t, idx, indent = "    ") {
@@ -191,7 +204,7 @@ function fmtTrade(t, idx, indent = "    ") {
   const hash    = (t.transactionHash || "").slice(0, 10) + "..."
   const ts      = t.timestamp ? toET(t.timestamp).slice(11, 19) : "—"
 
-  const outColor = outcome === "YES" ? C.green : C.red
+  const outColor = UP_OUTCOMES.has(outcome) ? C.green : C.red
   const sideStr  = side === "BUY" ? `${C.bold}BUY ${C.reset}` : `${C.dim}SELL${C.reset}`
 
   return `${indent}[${String(idx).padStart(2)}] ${ts}  ${sideStr} ${outColor}${outcome.padEnd(3)}${C.reset}  p:${price}  sz:${sz}  $:${usdc}  ${C.dim}${hash}${C.reset}`
@@ -285,14 +298,15 @@ function renderSingle(key) {
   out.push(`  ${C.bold}${C.white}${qLine1}${C.reset}`)
   out.push(qLine2 ? `  ${C.bold}${C.white}${qLine2}${C.reset}` : ``)
 
-  // Live prices
+  // Live prices — use the actual outcome labels this market trades (UP/DOWN or YES/NO)
+  const { up: upLabel, dn: dnLabel } = getOutcomeLabels(key)
   out.push(``)
   const upLine = yesPrice !== null
-    ? `  ${C.green}${C.bold}↑  YES   ${yesPrice.toFixed(4)}${C.reset}  ${C.dim}(${(yesPrice * 100).toFixed(1)}% chance UP)${C.reset}`
-    : `  ${C.dim}↑  YES   —${C.reset}`
+    ? `  ${C.green}${C.bold}↑  ${upLabel.padEnd(4)}  ${yesPrice.toFixed(4)}${C.reset}  ${C.dim}(${(yesPrice * 100).toFixed(1)}%)${C.reset}`
+    : `  ${C.dim}↑  ${upLabel.padEnd(4)}  —${C.reset}`
   const dnLine = noPrice !== null
-    ? `  ${C.red}${C.bold}↓  NO    ${noPrice.toFixed(4)}${C.reset}  ${C.dim}(${(noPrice * 100).toFixed(1)}% chance DOWN)${C.reset}`
-    : `  ${C.dim}↓  NO    —${C.reset}`
+    ? `  ${C.red}${C.bold}↓  ${dnLabel.padEnd(4)}  ${noPrice.toFixed(4)}${C.reset}  ${C.dim}(${(noPrice * 100).toFixed(1)}%)${C.reset}`
+    : `  ${C.dim}↓  ${dnLabel.padEnd(4)}  —${C.reset}`
   out.push(upLine)
   out.push(dnLine)
 
